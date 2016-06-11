@@ -1,5 +1,5 @@
 from matplotlib import pyplot as plt
-from scipy.misc import imresize
+from scipy.misc import imresize, toimage
 
 import dicom
 import fnmatch
@@ -11,7 +11,7 @@ from initializer import *
 
 # train and validate images will be resized to square with side
 IMAGE_SIZE = 256
-BATCH_SIZE = 2
+BATCH_SIZE = 5
 
 
 def convolution2d(x_img, W_conv):
@@ -29,9 +29,14 @@ def max_pool_2x2(x_img):
 
 
 class FCNN:
-    def __init__(self, train_dir=None, val_dir=None):
+    def __init__(self, train_dir=None, val_dir=None, _lambda=None):
         self.train_dir = train_dir
         self.val_dir = val_dir
+
+        if _lambda is None:
+            self._lambda = 3e-3
+        else:
+            self._lambda = _lambda
 
         self.train_images = np.empty(0)
         self.train_labels = np.empty(0)
@@ -109,8 +114,19 @@ class FCNN:
             deconvolution2d(self.h_deconv2, self.W_deconv1, self.deconv1_shape) + self.b_deconv1)
 
         self.y = tf.reshape(self.h_deconv1, [-1, np.square(IMAGE_SIZE)])
-        self.error = tf.nn.l2_loss(self.y_ - self.y)
-        self.train_step = tf.train.AdamOptimizer(1e-4).minimize(self.error)
+        self.error = tf.reduce_mean(tf.square(self.y - self.y_)) + \
+                     self._lambda / 2 * \
+                     (
+                         tf.reduce_mean(tf.square(self.W_conv1)) +
+                         tf.reduce_mean(tf.square(self.W_conv2)) +
+                         tf.reduce_mean(tf.square(self.W_conv3)) +
+                         tf.reduce_mean(tf.square(self.W_conv4)) +
+                         tf.reduce_mean(tf.square(self.W_deconv4)) +
+                         tf.reduce_mean(tf.square(self.W_deconv3)) +
+                         tf.reduce_mean(tf.square(self.W_deconv2)) +
+                         tf.reduce_mean(tf.square(self.W_deconv1))
+                     )
+        self.train_step = tf.train.AdamOptimizer(1e-5).minimize(self.error)
 
         self.session_started = False
         self.session = tf.Session()
@@ -191,30 +207,45 @@ class FCNN:
             batch_images = np.reshape(self.train_images[indices], [-1, np.square(IMAGE_SIZE)])
             batch_labels = np.reshape(self.train_labels[indices], [-1, np.square(IMAGE_SIZE)])
             if i % 100 == 0:
-                train_accuracy = self.session.run(self.error,
+                train_accuracy = self.session.run(tf.reduce_mean(tf.abs(self.y - self.y_)),
                                                   feed_dict={self.x: batch_images, self.y_: batch_labels})
                 print "step %d, training accuracy %g" % (i, train_accuracy)
-                plt.set_cmap('gray')
-                plt.figure(0)
-                plt.imshow(np.reshape(batch_images[0], [IMAGE_SIZE, IMAGE_SIZE]))
-                plt.figure(1)
-                plt.imshow(np.reshape(self.session.run(self.y,
-                                                       feed_dict={self.x: [batch_images[0]]}),
-                                      [IMAGE_SIZE, IMAGE_SIZE]))
-                plt.figure(2)
-                plt.imshow(np.reshape(batch_labels[0], [IMAGE_SIZE, IMAGE_SIZE]))
+                directory = './pics/' + str(self._lambda) + '_' + str(i) + "/"
+                if not os.path.exists(directory):
+                    os.makedirs(directory)
 
-                plt.show(block=True)
+                prediction = self.session.run(self.y, feed_dict={self.x: [batch_images[0]]})
+                toimage(np.reshape(batch_images[0], [IMAGE_SIZE, IMAGE_SIZE]), cmin=0., cmax=1.).\
+                    save(directory + 'image.jpg')
+                toimage(np.reshape(prediction, [IMAGE_SIZE, IMAGE_SIZE]), cmin=0., cmax=1.).\
+                    save(directory + 'prediction.jpg')
+                toimage(np.reshape(batch_labels[0], [IMAGE_SIZE, IMAGE_SIZE]), cmin=0., cmax=1.).\
+                    save(directory + 'ground.jpg')
+                # plt.set_cmap('gray')
+                # plt.figure(0)
+                # plt.imshow(np.reshape(batch_images[0], [IMAGE_SIZE, IMAGE_SIZE]))
+                # plt.figure(1)
+                # plt.imshow(np.reshape(self.session.run(self.y,
+                #                                        feed_dict={self.x: [batch_images[0]]}),
+                #                       [IMAGE_SIZE, IMAGE_SIZE]))
+                # plt.figure(2)
+                # plt.imshow(np.reshape(batch_labels[0], [IMAGE_SIZE, IMAGE_SIZE]))
+                #
+                # plt.show(block=True)
+
+            if i % 1000 == 0:
+                self.save_path = self.saver.save(self.session,
+                                                 "./models/fcnn_model_" + str(self._lambda) + "_" + str(i) + ".ckpt")
 
             self.session.run(self.train_step, feed_dict={self.x: batch_images, self.y_: batch_labels})
 
         validate_images = np.reshape(self.val_images, [-1, np.square(IMAGE_SIZE)])
         validate_labels = np.reshape(self.val_labels, [-1, np.square(IMAGE_SIZE)])
-        final_accuracy = self.session.run(self.error,
+        final_accuracy = self.session.run(tf.reduce_mean(tf.abs(self.y - self.y_)),
                                           feed_dict={self.x: validate_images, self.y_: validate_labels})
         print "Final error %g" % final_accuracy
 
-        self.save_path = self.saver.save(self.session, "./fcnn_model.ckpt")
+        self.save_path = self.saver.save(self.session, "./models/fcnn_model_" + str(self._lambda) + ".ckpt")
 
     def predict(self, image):
         """
@@ -241,18 +272,21 @@ class FCNN:
 
 
 if __name__ == "__main__":
-    with FCNN() as network:
-        if len(sys.argv) == 1 or sys.argv[1] == 'train':
-            network.set_train_dir("./data/train")
-            network.set_val_dir("./data/validate")
+    if len(sys.argv) == 1 or sys.argv[1] == 'train':
+        for _lambda in [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]:
+            with FCNN(_lambda=_lambda) as network:
 
-            if len(sys.argv) < 3:
-                iterations = 10000
-            else:
-                iterations = int(sys.argv[2])
-            network.train(iterations=iterations)
+                network.set_train_dir("./data/train")
+                network.set_val_dir("./data/validate")
 
-        elif sys.argv[1] == 'predict':
+                if len(sys.argv) < 3:
+                    iterations = 10000
+                else:
+                    iterations = int(sys.argv[2])
+                network.train(iterations=iterations)
+
+    elif sys.argv[1] == 'predict':
+        with FCNN() as network:
             if len(sys.argv) < 4:
                 img_path = './data/validate/image1.dcm'
                 lbl_path = './data/validate/ribsMask1.dcm'
@@ -266,7 +300,7 @@ if __name__ == "__main__":
             lbl = np.reshape(imresize(dicom.read_file(lbl_path).pixel_array,
                                       [IMAGE_SIZE, IMAGE_SIZE]), [np.square(IMAGE_SIZE)])
             lbl = lbl / lbl.max()
-            network.load_model('./fcnn_model.ckpt')
+            network.load_model('./fcnn_model_0.003_6000.ckpt')
             pred = network.predict(img)
             pred[pred < 0.5] = 0
             pred[pred != 0] = 1
